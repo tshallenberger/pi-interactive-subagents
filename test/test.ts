@@ -1292,40 +1292,87 @@ describe("subagent discovery", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
   });
 
-  it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
-    withTempDir((d) => {
-      const parts: string[] = [];
-      testApi.applySandboxToParts(
-        parts,
-        {
-          agent: "worker",
-          toolAllowlist: "read,write,safe_bash",
-          model: "openrouter/z-ai/glm-5.2",
-          thinking: "medium",
-          systemPromptMode: "append",
-          identity: "You are a worker.",
-          spawnable: ["scout"],
-          autoExit: true,
-          cwd: null,
-          agentDir: null,
-        },
-        { artifactDir: d, name: "worker" },
-      );
-      const joined = parts.join(" ");
-      // Model with thinking suffix.
-      assert.ok(joined.includes("--model"), "expected --model");
-      assert.ok(joined.includes("openrouter/z-ai/glm-5.2:medium"), "expected model:thinking");
-      // Identity written to a file and appended.
-      assert.ok(joined.includes("--append-system-prompt"), "expected --append-system-prompt");
-      // Default-deny restriction.
-      assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
-      const toolsIdx = parts.indexOf("--tools");
-      assert.ok(toolsIdx >= 0, "expected --tools");
-      // The value is shell-escaped (single-quoted) before joining.
-      assert.ok(
-        parts[toolsIdx + 1].includes("read,write,safe_bash"),
-        "expected the tool allowlist as the --tools value",
-      );
+  const restrictedLoadout = {
+    agent: "worker",
+    toolAllowlist: "read,write,safe_bash",
+    model: "openrouter/z-ai/glm-5.2",
+    thinking: "medium",
+    systemPromptMode: "append",
+    identity: "You are a worker.",
+    spawnable: ["scout"],
+    autoExit: true,
+    cwd: null,
+    agentDir: null,
+  };
+
+  function writeGuardExtensions(globalDir: string, files = ["global-guard.ts", "bash-policy.ts"]) {
+    const extDir = join(globalDir, "extensions");
+    mkdirSync(extDir, { recursive: true });
+    for (const file of files) writeFileSync(join(extDir, file), "export default () => {};\n");
+    return extDir;
+  }
+
+  it("applySandboxToParts loads both guard extensions into a restricted child", async () => {
+    await withIsolatedAgentEnv(({ globalDir }) => {
+      const extDir = writeGuardExtensions(globalDir);
+      withTempDir((d) => {
+        const parts: string[] = [];
+        testApi.applySandboxToParts(parts, restrictedLoadout, { artifactDir: d, name: "worker" });
+        const loaded = parts.flatMap((p, i) => (parts[i - 1] === "-e" ? [p] : []));
+        for (const file of ["global-guard.ts", "bash-policy.ts"]) {
+          assert.ok(
+            loaded.includes(shellEscape(join(extDir, file))),
+            `expected -e for ${file}, got ${JSON.stringify(loaded)}`,
+          );
+        }
+      });
+    });
+  });
+
+  for (const missing of ["global-guard.ts", "bash-policy.ts"]) {
+    it(`applySandboxToParts refuses a restricted spawn when ${missing} is missing`, async () => {
+      await withIsolatedAgentEnv(({ globalDir }) => {
+        const present = ["global-guard.ts", "bash-policy.ts"].filter((f) => f !== missing);
+        writeGuardExtensions(globalDir, present);
+        withTempDir((d) => {
+          const parts: string[] = [];
+          assert.throws(
+            () =>
+              testApi.applySandboxToParts(parts, restrictedLoadout, {
+                artifactDir: d,
+                name: "worker",
+              }),
+            new RegExp(`Subagent spawn refused: guard extension .*${missing} not found`),
+          );
+          assert.deepEqual(parts, [], "nothing should be pushed before the refusal");
+          assert.equal(existsSync(join(d, "context")), false, "no system-prompt file on refusal");
+        });
+      });
+    });
+  }
+
+  it("applySandboxToParts replays model, identity, and default-deny tool restriction", async () => {
+    await withIsolatedAgentEnv(({ globalDir }) => {
+      writeGuardExtensions(globalDir);
+      withTempDir((d) => {
+        const parts: string[] = [];
+        testApi.applySandboxToParts(parts, restrictedLoadout, { artifactDir: d, name: "worker" });
+        const joined = parts.join(" ");
+        // Model with thinking suffix.
+        assert.ok(joined.includes("--model"), "expected --model");
+        assert.ok(joined.includes("openrouter/z-ai/glm-5.2:medium"), "expected model:thinking");
+        // Identity written to a file and appended.
+        assert.ok(joined.includes("--append-system-prompt"), "expected --append-system-prompt");
+        // Default-deny restriction.
+        assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
+        const toolsIdx = parts.indexOf("--tools");
+        assert.ok(toolsIdx >= 0, "expected --tools");
+        // The value is shell-escaped (single-quoted) before joining.
+        assert.ok(
+          parts[toolsIdx + 1].includes("read,write,safe_bash"),
+          "expected the tool allowlist as the --tools value",
+        );
+      });
     });
   });
 

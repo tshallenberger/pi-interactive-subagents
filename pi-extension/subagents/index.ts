@@ -821,6 +821,27 @@ function buildSubagentToolAllowlist(
   return [...allow].join(",");
 }
 
+/** Guard extensions every restricted child loads, from the agent config dir's extensions/. */
+const GUARD_EXTENSIONS = ["global-guard.ts", "bash-policy.ts"] as const;
+
+/**
+ * `--no-extensions` would otherwise drop the user's guard extensions, leaving a
+ * child with `bash` unguarded. Refuse the spawn rather than run without them.
+ */
+function getGuardExtensionPaths(): string[] {
+  const extBase = join(getAgentConfigDir(), "extensions");
+  return GUARD_EXTENSIONS.map((file) => {
+    const path = join(extBase, file);
+    if (!existsSync(path)) {
+      throw new Error(
+        `Subagent spawn refused: guard extension ${path} not found. ` +
+          "Remedy: link it into the extensions dir (dotfiles setup.sh).",
+      );
+    }
+    return path;
+  });
+}
+
 /**
  * Apply a loadout snapshot's sandbox to a pi command's `parts` array: model,
  * identity (system prompt), and the default-deny tool/extension restriction
@@ -837,6 +858,9 @@ function applySandboxToParts(
   loadout: SubagentLoadout,
   opts: { artifactDir: string; name: string },
 ): void {
+  // Checked first so a refused spawn leaves no system-prompt file behind.
+  const guardPaths = loadout.toolAllowlist ? getGuardExtensionPaths() : [];
+
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
     parts.push("--model", shellEscape(model));
@@ -864,7 +888,7 @@ function applySandboxToParts(
     parts.push("--no-extensions");
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
 
-    const extPaths = new Set<string>();
+    const extPaths = new Set<string>(guardPaths);
     for (const tool of loadout.toolAllowlist.split(",")) {
       const extPath = getToolExtensionPath(tool);
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
@@ -1204,6 +1228,7 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
+  getGuardExtensionPaths(); // fail before opening a pane
   const surface = options?.surface ?? createSurface(params.name);
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
@@ -2149,6 +2174,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
+        getGuardExtensionPaths(); // fail before opening a pane
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
