@@ -24,7 +24,9 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
-} from "./tmux.ts";
+  withExitMarker,
+  announceSurface,
+} from "./mux.ts";
 
 import {
   countSessionEntryLines,
@@ -508,10 +510,10 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require tmux. ${muxSetupHint()}`,
+        text: `Subagents need a terminal backend. ${muxSetupHint()}`,
       },
     ],
-    details: { error: "tmux not available" },
+    details: { error: "terminal backend not available" },
   };
 }
 
@@ -1032,7 +1034,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}" via the terminal backend: ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1296,7 +1298,7 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = withExitMarker(surface, `${cdPrefix}${cmdParts.join(" ")}`);
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1314,6 +1316,7 @@ async function launchSubagent(
         `# Surface: ${surface}`,
       ].join("\n"),
     });
+    await announceSurface(surface);
 
     const running: RunningSubagent = {
       id,
@@ -1439,7 +1442,7 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = withExitMarker(surface, piCommand);
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1456,6 +1459,7 @@ async function launchSubagent(
       `# Surface: ${surface}`,
     ].join("\n"),
   });
+  await announceSurface(surface);
 
   const running: RunningSubagent = {
     id,
@@ -2238,7 +2242,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = withExitMarker(
+          surface,
+          `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`,
+        );
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2259,6 +2266,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
           ].join("\n"),
         });
+        await announceSurface(surface);
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {

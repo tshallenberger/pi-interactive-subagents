@@ -258,7 +258,7 @@ export interface PollResult {
  * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
  * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
  */
-function interpretExitSidecar(data: any): PollResult {
+export function interpretExitSidecar(data: any): PollResult {
   if (data?.type === "error") {
     const errorMessage =
       typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
