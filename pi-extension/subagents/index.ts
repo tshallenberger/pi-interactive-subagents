@@ -26,6 +26,7 @@ import {
   readScreen,
   withExitMarker,
   announceSurface,
+  releaseAllSurfaces,
 } from "./mux.ts";
 
 import {
@@ -1702,6 +1703,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    void releaseAllSurfaces().catch(() => {});
   });
 
   // The spawning tools are always registered here. Whether a child process can

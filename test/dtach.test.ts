@@ -14,6 +14,7 @@ import {
   closeSurface,
   createSurface,
   pollForExit,
+  releaseAllChildren,
   sendCommand,
   sendLongCommand,
   withExitMarker,
@@ -252,6 +253,15 @@ describe("dtach closeSurface", () => {
     writeFileSync(surface, "");
     assert.throws(() => closeSurface(surface), /Cannot stop the child .*no usable pid file/);
   });
+
+  it("is a no-op when the socket outlives a child it already stopped", () => {
+    const surface = createSurface("scout");
+    writeFileSync(surface, "");
+    // A pid above macOS's and Linux's default maximum: the kill finds no group.
+    writeFileSync(surface.replace(/\.sock$/, ".pid"), "4194304\n");
+    closeSurface(surface);
+    closeSurface(surface);
+  });
 });
 
 describe("dtach sendCommand", () => {
@@ -319,6 +329,100 @@ describe("dtach announceSurface", () => {
   });
 });
 
+describe("dtach announce limit and release", () => {
+  type Call = { url: string; method: string; auth?: string };
+  function fakeFetch(respond: (call: Call) => Response | Promise<Response>): Call[] {
+    const calls: Call[] = [];
+    globalThis.fetch = (async (url: string, init: any) => {
+      const call = { url, method: init.method, auth: init.headers.Authorization };
+      calls.push(call);
+      return respond(call);
+    }) as typeof fetch;
+    return calls;
+  }
+  const deletes = (calls: Call[]) => calls.filter((c) => c.method === "DELETE");
+
+  async function startAnnounced(body: string, calls: Call[]): Promise<string> {
+    const surface = start("scout", body);
+    await announceSurface(surface);
+    assert.equal(calls.length, 1);
+    return surface;
+  }
+
+  it("fails the start naming the child limit on 409 child_limit", async () => {
+    fakeFetch(() => new Response('{"code":"child_limit"}', { status: 409 }));
+    const surface = start("scout", "sleep 30");
+    await until(() => existsSync(surface));
+    await assert.rejects(
+      announceSurface(surface),
+      /child_limit.*maximum of 16 children.*The child was stopped/s,
+    );
+    await until(() => !existsSync(surface));
+  });
+
+  it("sends DELETE with the agent key when the child exits", async () => {
+    const calls = fakeFetch(() => new Response(null, { status: 204 }));
+    const surface = await startAnnounced("true", calls);
+    await poll(surface);
+    await until(() => deletes(calls).length === 1);
+    const [del] = deletes(calls);
+    assert.equal(
+      del.url,
+      `http://api.test:7777/v1/threads/thread-x/children/${childIdFromSurface(surface)}`,
+    );
+    assert.equal(del.auth, "Bearer key-1");
+  });
+
+  it("sends DELETE once when the child is killed, even if closed again", async () => {
+    const calls = fakeFetch(() => new Response(null, { status: 204 }));
+    const surface = await startAnnounced("sleep 30", calls);
+    closeSurface(surface);
+    await until(() => deletes(calls).length >= 1);
+    await until(() => !existsSync(surface));
+    assert.deepEqual(await poll(surface), { reason: "sentinel", exitCode: 143 });
+    closeSurface(surface);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(deletes(calls).length, 1);
+    assert.equal(deletes(calls)[0].auth, "Bearer key-1");
+  });
+
+  it("ignores a 404 and a network error, and still reports the exit", async () => {
+    for (const respond of [
+      () => new Response("{}", { status: 404 }),
+      () => {
+        throw new Error("ECONNREFUSED");
+      },
+    ]) {
+      const calls = fakeFetch((c) => (c.method === "POST" ? new Response("{}") : respond()));
+      const surface = await startAnnounced("sh -c 'exit 3'", calls);
+      assert.deepEqual(await poll(surface), { reason: "sentinel", exitCode: 3 });
+      await until(() => deletes(calls).length === 1);
+    }
+  });
+
+  it("sends nothing for a child that was never announced", async () => {
+    const calls = fakeFetch(() => new Response(null, { status: 204 }));
+    const surface = start("scout", "true");
+    await poll(surface);
+    closeSurface(surface);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 0);
+  });
+
+  it("releases every registered child on shutdown", async () => {
+    fakeFetch(() => new Response(null, { status: 204 }));
+    await releaseAllChildren(); // drop children registered by earlier tests
+    const calls = fakeFetch(() => new Response(null, { status: 204 }));
+    const surface = start("scout", "sleep 30");
+    await announceSurface(surface);
+    await releaseAllChildren();
+    assert.equal(deletes(calls).length, 1);
+    closeSurface(surface);
+    await until(() => !existsSync(surface));
+    assert.equal(deletes(calls).length, 1);
+  });
+});
+
 describe("mux backend switch", () => {
   it("chooses by environment, and a forced value wins", () => {
     assert.equal(mux.selectBackend({}), "tmux");
@@ -351,5 +455,13 @@ describe("mux backend switch", () => {
       throw new Error("must not be called");
     }) as typeof fetch;
     await mux.announceSurface("%1");
+  });
+
+  it("sends no DELETE under tmux", async () => {
+    process.env.PI_SUBAGENT_MUX = "tmux";
+    globalThis.fetch = (async () => {
+      throw new Error("must not be called");
+    }) as typeof fetch;
+    await mux.releaseAllSurfaces();
   });
 });

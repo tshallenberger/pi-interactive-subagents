@@ -62,6 +62,11 @@ export async function announceSurface(surface: string): Promise<void> {
   if (selectBackend() === "dtach") await dtach.announceSurface(surface);
 }
 
+/** Release every child still registered with the saga API. Does nothing under tmux. */
+export async function releaseAllSurfaces(): Promise<void> {
+  if (selectBackend() === "dtach") await dtach.releaseAllChildren();
+}
+
 export function readScreen(surface: string, lines = 50): string {
   return selectBackend() === "dtach" ? dtach.readScreen() : tmux.readScreen(surface, lines);
 }

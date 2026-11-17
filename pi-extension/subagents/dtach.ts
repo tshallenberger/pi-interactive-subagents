@@ -25,6 +25,11 @@ const KILLED_EXIT_CODE = 143;
 const SOCKET_GRACE_MS = 5000;
 const PID_WAIT_MS = 3000;
 const ANNOUNCE_TIMEOUT_MS = 10_000;
+/** The saga API's cap on children per thread. */
+const MAX_CHILDREN = 16;
+const RELEASE_TIMEOUT_MS = 5000;
+/** Children the saga API has accepted and that have not been released yet. */
+const registeredChildren = new Set<string>();
 
 function runDir(): string {
   return process.env.SAGA_RUN_DIR || DEFAULT_RUN_DIR;
@@ -181,15 +186,58 @@ export async function announceSurface(surface: string): Promise<void> {
       body: JSON.stringify({ id }),
       signal: AbortSignal.timeout(ANNOUNCE_TIMEOUT_MS),
     });
+    if (response.status === 409) {
+      const body = (await response.text()).slice(0, 200);
+      if (body.includes("child_limit")) {
+        throw new Error(
+          `child_limit: the thread already has the maximum of ${MAX_CHILDREN} children; ` +
+            `wait for one to finish (${body})`,
+        );
+      }
+      throw new Error(`HTTP 409 ${body}`);
+    }
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} ${(await response.text()).slice(0, 200)}`);
     }
+    registeredChildren.add(id);
   } catch (error: any) {
     closeSurface(surface);
     throw new Error(
       `Could not announce subagent ${id} to ${url}: ${error?.message ?? String(error)}. ` +
         `The child was stopped.`,
     );
+  }
+}
+
+/**
+ * Tell the saga API a child has ended: DELETE the id registered by announceSurface. Best
+ * effort and fire-and-forget: a failure is logged and ignored, 404 counts as done, and the
+ * parent's result never waits on it. Does nothing for a child that is not registered.
+ */
+export function releaseChild(id: string): Promise<void> {
+  if (!registeredChildren.delete(id)) return Promise.resolve();
+  return sendRelease(id);
+}
+
+/** Release every child still registered, for session shutdown. */
+export function releaseAllChildren(): Promise<void> {
+  return Promise.all([...registeredChildren].map(releaseChild)).then(() => undefined);
+}
+
+async function sendRelease(id: string): Promise<void> {
+  try {
+    const url =
+      `${requireEnv("SAGA_API_URL")}/v1/threads/${requireEnv("SAGA_THREAD")}/children/${encodeURIComponent(id)}`;
+    const response = await fetch(url, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${requireEnv("SAGA_AGENT_KEY")}` },
+      signal: AbortSignal.timeout(RELEASE_TIMEOUT_MS),
+    });
+    if (!response.ok && response.status !== 404) {
+      console.warn(`saga: DELETE child ${id} returned HTTP ${response.status}; ignored`);
+    }
+  } catch (error: any) {
+    console.warn(`saga: DELETE child ${id} failed: ${error?.message ?? String(error)}; ignored`);
   }
 }
 
@@ -233,18 +281,24 @@ function readPid(surface: string): number | null {
 export function closeSurface(surface: string): void {
   const pid = readPid(surface);
   if (pid === null) {
-    if (existsSync(surface)) {
+    // The socket can outlive a stopped child by a moment; the marker says it was stopped.
+    if (existsSync(surface) && !existsSync(siblingPath(surface, "stopped"))) {
       const pidFile = siblingPath(surface, "pid");
       throw new Error(`Cannot stop the child at ${surface}: no usable pid file ${pidFile}`);
     }
+    void releaseChild(childIdFromSurface(surface));
     return;
   }
   try {
     process.kill(-pid, "SIGTERM");
   } catch (error: any) {
-    if (error?.code !== "ESRCH") throw error;
+    // ESRCH: the group is gone. EPERM: macOS answers it for a group whose processes are all
+    // zombies; the child runs as this user, so it cannot be a real refusal.
+    if (error?.code !== "ESRCH" && error?.code !== "EPERM") throw error;
   }
   rmSync(siblingPath(surface, "pid"), { force: true });
+  writeFileSync(siblingPath(surface, "stopped"), "");
+  void releaseChild(childIdFromSurface(surface));
 }
 
 // ── Exit polling ──
@@ -304,12 +358,24 @@ function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
 export async function pollForExit(
   surface: string,
   signal: AbortSignal,
-  options: {
-    interval: number;
-    sessionFile?: string;
-    sentinelFile?: string;
-    onTick?: (elapsed: number) => void;
-  },
+  options: PollOptions,
+): Promise<PollResult> {
+  const result = await pollUntilEnded(surface, signal, options);
+  void releaseChild(childIdFromSurface(surface));
+  return result;
+}
+
+type PollOptions = {
+  interval: number;
+  sessionFile?: string;
+  sentinelFile?: string;
+  onTick?: (elapsed: number) => void;
+};
+
+async function pollUntilEnded(
+  surface: string,
+  signal: AbortSignal,
+  options: PollOptions,
 ): Promise<PollResult> {
   const state = { sawSocket: false, startedAt: Date.now() };
   for (;;) {
