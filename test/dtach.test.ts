@@ -433,6 +433,14 @@ describe("mux backend switch", () => {
     assert.equal(mux.selectBackend({ PI_SUBAGENT_MUX: "dtach" }), "dtach");
   });
 
+  it("starts a child pi with --no-approve under dtach and plain pi under tmux", () => {
+    const saga = { SAGA_API_URL: "u", SAGA_THREAD: "t" };
+    assert.deepEqual(mux.piCommandHead(saga), ["pi", "--no-approve"]);
+    assert.deepEqual(mux.piCommandHead({ PI_SUBAGENT_MUX: "dtach" }), ["pi", "--no-approve"]);
+    assert.deepEqual(mux.piCommandHead({}), ["pi"]);
+    assert.deepEqual(mux.piCommandHead({ PI_SUBAGENT_MUX: "tmux", ...saga }), ["pi"]);
+  });
+
   it("rejects an unknown forced value", () => {
     assert.throws(
       () => mux.selectBackend({ PI_SUBAGENT_MUX: "screen" }),

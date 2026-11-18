@@ -35,6 +35,15 @@ export function createSurface(name: string): string {
   return selectBackend() === "dtach" ? dtach.createSurface(name) : tmux.createSurface(name);
 }
 
+/**
+ * The start of a child's pi command. In a saga container `~/.pi/agent` is read-only, and pi
+ * takes a lock there at every start unless `--no-approve` is given, so a child would exit at
+ * once. On a host the command stays plain `pi`.
+ */
+export function piCommandHead(env: NodeJS.ProcessEnv = process.env): string[] {
+  return selectBackend(env) === "dtach" ? ["pi", "--no-approve"] : ["pi"];
+}
+
 /** The command that makes the launch script report its exit code. */
 export function withExitMarker(surface: string, command: string): string {
   return selectBackend() === "dtach"
